@@ -11,8 +11,20 @@ import sys
 import time
 from pathlib import Path
 
+try:  # 拼音首字母表（tools/gen_pinyin.py 生成）；缺失时仅关闭首字母搜索
+    from ccr_pinyin_data import BASE as PY_BASE, INITIALS as PY_INITIALS, POLY as PY_POLY
+except ImportError:
+    PY_BASE, PY_INITIALS, PY_POLY = 0, "", {}
+
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 HOME = str(Path.home())
+# 多音字展开的缩写变体上限，避免组合爆炸与模糊匹配噪声
+MAX_ACRONYM_VARIANTS = 8
+# 缩写片段的最大长度（查询超过这么多个首字母的情况极少）
+ACRONYM_GRAM = 12
+# 缩写前的填充宽度：把缩写推到屏幕外，仅参与 fzf 搜索不显示
+# （配合 fzf --no-hscroll --ellipsis=''；fzf 不支持搜索隐藏字段）
+ACRONYM_PAD = " " * 512
 # preview 渲染结果缓存目录，按 sessionId 存，用源文件 mtime+size 做失效校验
 CACHE_DIR = Path.home() / ".cache" / "ccr" / "preview"
 
@@ -175,21 +187,56 @@ def truncate(s: str, n: int) -> str:
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
+def title_acronyms(title: str) -> str:
+    """标题的拼音首字母缩写，供 fzf 搜索；不含汉字时返回空串。
+
+    汉字取首字母，ASCII 字母数字原样小写，其余字符跳过：
+      「这是一个测试名称」→ zsygcsmc，「配置 CI 工作流」→ pzcigzl
+    多音字按读音展开为多个变体，超过上限后只取最常用读音：「重构」→ zg / cg
+
+    输出为每个变体从各个位置起的片段（去重、空格分隔）：「测试名称」→ csmc smc mc c。
+    这样任意连续词组的首字母都处在“词首”，能拿到 fzf 的词首加分，
+    排在零散字符拼凑出的模糊匹配之前（如 cs 不会被「CI … 25s ago」抢先）。
+    """
+    variants = [""]
+    has_cjk = False
+    for ch in title:
+        idx = ord(ch) - PY_BASE
+        if 0 <= idx < len(PY_INITIALS) and PY_INITIALS[idx] != "_":
+            has_cjk = True
+            opts = PY_POLY.get(ch) or PY_INITIALS[idx]
+            if len(variants) * len(opts) <= MAX_ACRONYM_VARIANTS:
+                variants = [v + o for v in variants for o in opts]
+            else:
+                variants = [v + opts[0] for v in variants]
+        elif ch.isascii() and ch.isalnum():
+            variants = [v + ch.lower() for v in variants]
+    if not has_cjk:
+        return ""
+    grams = dict.fromkeys(v[i:i + ACRONYM_GRAM] for v in variants for i in range(len(v)))
+    return " ".join(grams)
+
+
 def list_command():
     out = []
     for s in all_sessions():
         title = truncate(s["title"], 78)
+        # 只基于显示出来的标题生成缩写：搜的就是看到的，也避免长标题的缩写过长导致模糊匹配泛滥
+        acronym = title_acronyms(title)
         meta_bits = [rel_time(s["mtime"])]
         if s["branch"]:
             meta_bits.append(s["branch"])
         meta_bits.append(human_size(s["size"]))
         meta = " · ".join(meta_bits)
         path = pretty_path(s["cwd"]) if s["cwd"] else "(未知路径)"
-        # 两行展示：标题行 + 元信息行（含完整路径）
+        # 两行展示：标题行 + 元信息行（含完整路径）；
+        # 拼音缩写拼在第二行屏幕外，可被搜索但不可见
         display = (
             f"{CYAN}❯ {BOLD}{title}{RESET}\n"
             f"  {DIM}{meta}{RESET}  {GREEN}{path}{RESET}"
         )
+        if acronym:
+            display += ACRONYM_PAD + acronym
         # 记录：display \t cwd \t sessionId，NUL 结尾供 fzf --read0
         out.append(f"{display}\t{s['cwd']}\t{s['id']}")
     sys.stdout.write("\0".join(out))
