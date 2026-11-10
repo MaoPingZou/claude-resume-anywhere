@@ -13,6 +13,8 @@ from pathlib import Path
 
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 HOME = str(Path.home())
+# preview 渲染结果缓存目录，按 sessionId 存，用源文件 mtime+size 做失效校验
+CACHE_DIR = Path.home() / ".cache" / "ccr" / "preview"
 
 # ── ANSI 颜色 ─────────────────────────────────────────────
 BOLD = "\033[1m"
@@ -198,21 +200,45 @@ def find_session_file(session_id: str):
     return matches[0] if matches else None
 
 
-def preview_command(session_id: str):
-    jf = find_session_file(session_id)
-    if not jf:
-        print("会话文件未找到")
-        return
-    info = scan_session(jf)
-    print(f"{BOLD}{info['title']}{RESET}")
-    print(f"{GREEN}{info['cwd'] or '(未知)'}{RESET}")
-    meta = [rel_time(info["mtime"]), human_size(info["size"])]
-    if info["branch"]:
-        meta.insert(1, f"⎇ {info['branch']}")
-    print(f"{DIM}{'  ·  '.join(meta)}{RESET}")
-    print(f"{DIM}{'─' * 46}{RESET}\n")
+def _cache_file(session_id: str) -> Path:
+    return CACHE_DIR / f"{session_id}.txt"
 
-    # 最近若干轮对话
+
+def _cache_get(session_id: str, mtime: float, size: int):
+    """命中且未失效则返回缓存的预览文本，否则 None。"""
+    try:
+        with _cache_file(session_id).open("r", encoding="utf-8") as f:
+            header = f.readline().rstrip("\n")
+            body = f.read()
+    except OSError:
+        return None
+    parts = header.split("\t")
+    if len(parts) != 2:
+        return None
+    try:
+        c_mtime, c_size = float(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+    return body if (c_mtime == mtime and c_size == size) else None
+
+
+def _cache_put(session_id: str, mtime: float, size: int, body: str):
+    """原子写入缓存；失败不影响主流程。"""
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = _cache_file(session_id).with_suffix(".tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            f.write(f"{mtime}\t{size}\n")
+            f.write(body)
+        tmp.replace(_cache_file(session_id))
+    except OSError:
+        pass
+
+
+def render_preview(jf: Path, st) -> str:
+    """单次读取 jsonl，一并解析元信息与最近对话，返回预览文本；读失败返回 None。"""
+    cwd = branch = None
+    custom_title = ai_title = last_prompt = first_user = None
     turns = []
     try:
         with jf.open("r", encoding="utf-8", errors="replace") as f:
@@ -225,18 +251,64 @@ def preview_command(session_id: str):
                 except json.JSONDecodeError:
                     continue
                 t = o.get("type")
+                if cwd is None and o.get("cwd"):
+                    cwd = o["cwd"]
+                if branch is None and o.get("gitBranch"):
+                    branch = o["gitBranch"]
+                if t == "custom-title" and o.get("customTitle"):
+                    custom_title = o["customTitle"]
+                elif t == "ai-title" and o.get("aiTitle"):
+                    ai_title = o["aiTitle"]
+                elif t == "last-prompt" and o.get("lastPrompt"):
+                    last_prompt = o["lastPrompt"]
                 if t in ("user", "assistant"):
                     txt = extract_text(o.get("message", {}).get("content")).strip()
                     if txt:
                         turns.append((t, txt))
+                        if first_user is None and t == "user":
+                            first_user = txt
     except OSError:
-        pass
+        return None
 
+    title = custom_title or ai_title or last_prompt or first_user or "(无标题)"
+    title = " ".join(title.split())
+    meta = [rel_time(st.st_mtime), human_size(st.st_size)]
+    if branch:
+        meta.insert(1, f"⎇ {branch}")
+    lines = [
+        f"{BOLD}{title}{RESET}",
+        f"{GREEN}{cwd or '(未知)'}{RESET}",
+        f"{DIM}{'  ·  '.join(meta)}{RESET}",
+        f"{DIM}{'─' * 46}{RESET}\n",
+    ]
     for role, txt in turns[-8:]:
         tag = f"{YELLOW}▸ 你{RESET}" if role == "user" else f"{CYAN}▸ Claude{RESET}"
-        print(tag)
-        print(truncate(" ".join(txt.split()), 300))
-        print()
+        lines.append(tag)
+        lines.append(truncate(" ".join(txt.split()), 300))
+        lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def preview_command(session_id: str):
+    jf = find_session_file(session_id)
+    if not jf:
+        print("会话文件未找到")
+        return
+    try:
+        st = jf.stat()
+    except OSError:
+        print("会话文件未找到")
+        return
+    cached = _cache_get(session_id, st.st_mtime, st.st_size)
+    if cached is not None:
+        sys.stdout.write(cached)
+        return
+    body = render_preview(jf, st)
+    if body is None:
+        print("会话无法读取")
+        return
+    _cache_put(session_id, st.st_mtime, st.st_size, body)
+    sys.stdout.write(body)
 
 
 def delete_command(session_id: str):
@@ -245,6 +317,9 @@ def delete_command(session_id: str):
         print("会话文件未找到")
         return
     info = scan_session(jf)
+    if info is None:
+        print("会话文件无法读取")
+        return
     print(f"{YELLOW}即将删除会话：{RESET}{BOLD}{info['title']}{RESET}")
     print(f"{DIM}{pretty_path(info['cwd'])} · {human_size(info['size'])}{RESET}")
 
@@ -275,6 +350,9 @@ def rename_command(session_id: str):
         print("会话文件未找到")
         return
     info = scan_session(jf)
+    if info is None:
+        print("会话文件无法读取")
+        return
     print(f"{DIM}当前标题：{RESET}{BOLD}{info['title']}{RESET}")
     try:
         new = ask(f"{CYAN}新标题: {RESET}").strip()
